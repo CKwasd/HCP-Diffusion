@@ -3,58 +3,51 @@
 pretrained_model: ''
 prompt: ''
 neg_prompt: 'lowres, bad anatomy, bad hands, text, error, missing fingers, extra digit, fewer digits, cropped, worst quality, low quality, normal quality, jpeg artifacts, signature, watermark, username, blurry'
-out_dir: 'output/'
 emb_dir: 'embs/'
 N_repeats: 1
+clip_skip: 0
+clip_final_norm: True
+encoder_attention_mask: True
 bs: 4
 num: 1
 seed: null
-fp16: True
+dtype: 'fp16'
+amp: True
 
 condition: null
 
+ex_input: {}
+
+# Syntactic sugar for interface
 save:
+  out_dir: 'output/'
   save_cfg: True
   image_type: png
   quality: 95
 #  image_type: webp
 #  quality: 75
 
+offload: null
+
+#vae_optimize: null
+vae_optimize:
+  tiling: False
+  slicing: False
+
+interface:
+  - _target_: hcpdiff.vis.DiskInterface
+    show_steps: 0
+    save_root: ${save.out_dir}
+    save_cfg: ${save.save_cfg}
+    image_type: ${save.image_type}
+    quality: ${save.quality}
+
 infer_args:
   width: 512
   height: 512
   guidance_scale: 7.5
+  num_inference_steps: 50
 
 new_components: {}
 
-merge: # can be null
-  exp_dir: '2023-04-03-10-10-36'
-  alpha: 0.8
-
-  group1:
-    type: 'unet'
-    base_model_alpha: 1.0 # base model weight to merge with lora or part
-    lora:
-      - path: 'exps/${....exp_dir}/ckpts/unet-600.safetensors'
-        alpha: ${....alpha}
-        layers: 'all'
-        mask: [0.5, 1]
-      - path: 'exps/${....exp_dir}/ckpts/unet-neg-600.safetensors'
-        alpha: 0.65
-        layers: 'all'
-        mask: [0, 0.5]
-    part: null
-
-  group2:
-    type: 'TE'
-    base_model_alpha: 1.0 # base model weight to infer with lora or part
-    lora:
-      - path: 'exps/${....exp_dir}/ckpts/text_encoder-600.safetensors'
-        alpha: ${....alpha}
-        layers: 'all'
-        mask: [0.5, 1]
-      - path: 'exps/${....exp_dir}/ckpts/text_encoder-neg-600.safetensors'
-        alpha: 0.65
-        layers: 'all'
-        mask: [0, 0.5]
-    part: null
+merge: null

@@ -11,21 +11,17 @@ lora.py
 import torch
 from torch import nn
 
-from hcpdiff.utils.utils import make_mask, low_rank_approximate
+from hcpdiff.utils.utils import make_mask, low_rank_approximate, isinstance_list
 from .plugin import SinglePluginBlock, PluginGroup, BasePluginBlock
 
 from typing import Union, Tuple, Dict, Type
 
 class LoraBlock(SinglePluginBlock):
-    def __init__(self, host:Union[nn.Linear, nn.Conv2d], rank, dropout=0.1, scale=1.0, bias=False, inplace=True,
-                 hook_param=None, **kwargs):
-        super().__init__(host, hook_param)
-        if hasattr(host, 'lora_block'):
-            self.id = len(host.lora_block)
-            host.lora_block.append(self)
-        else:
-            self.id = 0
-            host.lora_block=nn.ModuleList([self])
+    wrapable_classes = (nn.Linear, nn.Conv2d)
+
+    def __init__(self, lora_id:int, host:Union[nn.Linear, nn.Conv2d], rank, dropout=0.1, alpha=1.0, bias=False,
+                 inplace=True, hook_param=None, alpha_auto_scale=True, **kwargs):
+        super().__init__(f'lora_block_{lora_id}', host, hook_param)
 
         self.mask_range = None
         self.inplace=inplace
@@ -41,7 +37,7 @@ class LoraBlock(SinglePluginBlock):
             raise NotImplementedError(f'No lora for {type(host)}')
         self.rank = self.layer.rank
 
-        self.register_buffer('scale', torch.tensor(1.0 if scale == 0 else scale / self.rank))
+        self.register_buffer('alpha', torch.tensor(alpha/self.rank if alpha_auto_scale else alpha))
 
     def set_mask(self, mask_range):
         self.mask_range = mask_range
@@ -57,39 +53,29 @@ class LoraBlock(SinglePluginBlock):
 
     def forward(self, fea_in:Tuple[torch.Tensor], fea_out:torch.Tensor):
         if self.mask_range is None:
-            return fea_out + self.layer(fea_in[0]) * self.scale
+            return fea_out + self.layer(fea_in[0]) * self.alpha
         else:
             # for DreamArtist-lora
-            batch_mask = make_mask(self.mask_range[0], self.mask_range[1], fea_out.shape[0])
+            batch_mask = slice(int(self.mask_range[0]*fea_out.shape[0]), int(self.mask_range[1]*fea_out.shape[0]))
             if self.inplace:
-                fea_out[batch_mask, ...] = fea_out[batch_mask, ...] + self.layer(fea_in[0][batch_mask, ...]) * self.scale
+                fea_out[batch_mask, ...] = fea_out[batch_mask, ...] + self.layer(fea_in[0][batch_mask, ...]) * self.alpha
                 return fea_out
             else: # colossal-AI dose not support inplace+view
                 new_out = fea_out.clone()
-                new_out[batch_mask, ...] = fea_out[batch_mask, ...] + self.layer(fea_in[0][batch_mask, ...]) * self.scale
+                new_out[batch_mask, ...] = fea_out[batch_mask, ...] + self.layer(fea_in[0][batch_mask, ...]) * self.alpha
                 return new_out
 
-    def remove(self):
-        super().remove()
-        host = self.host()
-        for i in range(len(host.lora_block)):
-            if host.lora_block[i] == self:
-                del host.lora_block[i]
-                break
-        if len(host.lora_block)==0:
-            del host.lora_block
-
-    def collapse_to_host(self, alpha=None, base_alpha=1.0):
+    def reparameterization_to_host(self, alpha=None, base_alpha=1.0):
         if alpha is None:
-            alpha = self.scale
+            alpha = self.alpha
 
         host = self.host()
-        re_w, re_b = self.get_collapsed_param()
+        re_w, re_b = self.layer.get_collapsed_param()
         host.weight = nn.Parameter(
             host.weight.data * base_alpha + alpha * re_w.to(host.weight.device, dtype=host.weight.dtype)
         )
 
-        if self.lora_up.bias is not None:
+        if self.layer.lora_up.bias is not None:
             if host.bias is None:
                 host.bias = nn.Parameter(re_b.to(host.weight.device, dtype=host.weight.dtype))
             else:
@@ -100,6 +86,7 @@ class LoraBlock(SinglePluginBlock):
         def __init__(self, host, rank, bias, dropout, block):
             super().__init__()
             self.rank=rank
+            self.bias = bias
             if isinstance(self.rank, float):
                 self.rank = max(round(host.out_features * self.rank), 1)
             self.dropout = nn.Dropout(dropout)
@@ -118,6 +105,7 @@ class LoraBlock(SinglePluginBlock):
         def __init__(self, host, rank, bias, dropout, block):
             super().__init__()
             self.rank = rank
+            self.bias = bias
             if isinstance(self.rank, float):
                 self.rank = max(round(host.out_channels * self.rank), 1)
             self.dropout = nn.Dropout(dropout)
@@ -133,41 +121,32 @@ class LoraBlock(SinglePluginBlock):
             pass
 
     @classmethod
-    def warp_layer(cls, layer: Union[nn.Linear, nn.Conv2d], rank=1, dropout=0.1, scale=1.0, svd_init=False, bias=False, mask=None, **kwargs):# -> LoraBlock:
-        lora_block = cls(layer, rank, dropout, scale, bias=bias, **kwargs)
+    def wrap_layer(cls, lora_id:int, layer: Union[nn.Linear, nn.Conv2d], rank=1, dropout=0.0, alpha=1.0, svd_init=False,
+                   bias=False, mask=None, **kwargs):# -> LoraBlock:
+        lora_block = cls(lora_id, layer, rank, dropout, alpha, bias=bias, **kwargs)
         lora_block.init_weights(svd_init)
         lora_block.set_mask(mask)
         return lora_block
 
     @classmethod
-    def warp_model(cls, model: nn.Module, rank=1, dropout=0.0, scale=1.0, svd_init=False, bias=False, mask=None, **kwargs):# -> Dict[str, LoraBlock]:
-        lora_block_dict = {}
-        if isinstance(model, nn.Linear) or isinstance(model, nn.Conv2d):
-            lora_block_dict['lora_block'] = cls.warp_layer(model, rank, dropout, scale, svd_init, bias=bias, mask=mask, **kwargs)
-        else:
-            # there maybe multiple lora block, avoid insert lora into lora_block
-            named_modules = {name: layer for name, layer in model.named_modules() if 'lora_block' not in name}
-            for name, layer in named_modules.items():
-                if isinstance(layer, nn.Linear) or isinstance(layer, nn.Conv2d):
-                    lora_block_dict[f'{name}.lora_block'] = cls.warp_layer(layer, rank, dropout, scale, svd_init,
-                                                                bias=bias, mask=mask, **kwargs)
-        return lora_block_dict
+    def wrap_model(cls, lora_id:int, model: nn.Module, **kwargs):# -> Dict[str, LoraBlock]:
+        return super(LoraBlock, cls).wrap_model(lora_id, model, exclude_classes=(LoraBlock,), **kwargs)
 
     @staticmethod
     def extract_lora_state(model:nn.Module):
-        return {k:v for k,v in model.state_dict().items() if 'lora_block.' in k}
+        return {k:v for k,v in model.state_dict().items() if 'lora_block_' in k}
 
     @staticmethod
     def extract_state_without_lora(model:nn.Module):
-        return {k:v for k,v in model.state_dict().items() if 'lora_block.' not in k}
+        return {k:v for k,v in model.state_dict().items() if 'lora_block_' not in k}
 
     @staticmethod
     def extract_param_without_lora(model:nn.Module):
-        return {k:v for k,v in model.named_parameters() if 'lora_block.' not in k}
+        return {k:v for k,v in model.named_parameters() if 'lora_block_' not in k}
 
     @staticmethod
     def extract_trainable_state_without_lora(model:nn.Module):
-        trainable_keys = {k for k,v in model.named_parameters() if ('lora_block.' not in k) and v.requires_grad}
+        trainable_keys = {k for k,v in model.named_parameters() if ('lora_block_' not in k) and v.requires_grad}
         return {k: v for k, v in model.state_dict().items() if k in trainable_keys}
 
 class LoraGroup(PluginGroup):
@@ -186,7 +165,7 @@ class LoraGroup(PluginGroup):
 def split_state(state_dict):
     sd_base, sd_lora={}, {}
     for k, v in state_dict.items():
-        if 'lora_block.' in k:
+        if 'lora_block_' in k:
             sd_lora[k]=v
         else:
             sd_base[k]=v
